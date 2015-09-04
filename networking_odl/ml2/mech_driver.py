@@ -19,11 +19,9 @@ import six
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import excutils
-import requests
 
 from neutron.common import constants as n_const
 from neutron.common import exceptions as n_exc
-from neutron.common import utils
 from neutron import context as neutron_context
 from neutron.extensions import portbindings
 from neutron.extensions import securitygroup as sg
@@ -35,6 +33,8 @@ from networking_odl.common import callback as odl_call
 from networking_odl.common import client as odl_client
 from networking_odl.common import constants as odl_const
 from networking_odl.common import utils as odl_utils
+from networking_odl.db import journal_db
+from networking_odl.ml2 import state_syncer
 from networking_odl.openstack.common._i18n import _LE
 
 LOG = logging.getLogger(__name__)
@@ -205,77 +205,43 @@ class OpenDaylightDriver(object):
             cfg.CONF.ml2_odl.password,
             cfg.CONF.ml2_odl.timeout
         )
+        self.journal = journal_db.JournalDb()
         self.sec_handler = odl_call.OdlSecurityGroupsHandler(self)
         self.vif_details = {portbindings.CAP_PORT_FILTER: True}
+        self.state_syncer = state_syncer.OpenDaylightStateSyncer(self.journal)
+
+    def journal_resource(self, context,
+                         object_type, obj_id, operation, resource):
+        resource_str = self.client.serialize(resource)
+        self.journal.log(context, object_type, obj_id, operation, resource_str)
+
+    def journal(self, operation, object_type, context):
+        """Journal request to ODL."""
+        obj_id = context.current['id']
+        if operation == odl_const.ODL_DELETE:
+            resource = {}
+        else:
+            filter_cls = self.FILTER_MAP[object_type]
+            if operation == odl_const.ODL_CREATE:
+                attr_filter = filter_cls.filter_create_attributes
+            elif operation == odl_const.ODL_UPDATE:
+                attr_filter = filter_cls.filter_update_attributes
+            resource = context.current.copy()
+            attr_filter(resource, context)
+        self.journal_resource(context,
+                              object_type, obj_id, operation, resource)
 
     def synchronize(self, operation, object_type, context):
         """Synchronize ODL with Neutron following a configuration change."""
-        if self.out_of_sync:
-            self.sync_full(context._plugin)
-        else:
-            self.sync_single_resource(operation, object_type, context)
+        # TODO(yamahata): try to synchronize this resource in ahead of
+        # state_syncer in order to reduce latency in case of good condition
+        # self.sync_single_resource(operation, object_type, context)
+        # if in case of complex situation, punt this task to state_syncer
+        # self.sync_single_resource()
+        self.state_syncer.wakeup()
 
-    def sync_resources(self, plugin, dbcontext, collection_name):
-        """Sync objects from Neutron over to OpenDaylight.
-
-        This will handle syncing networks, subnets, and ports from Neutron to
-        OpenDaylight. It also filters out the requisite items which are not
-        valid for create API operations.
-        """
-        filter_cls = self.FILTER_MAP[collection_name]
-        to_be_synced = []
-        obj_getter = getattr(plugin, 'get_%s' % collection_name)
-        if collection_name == odl_const.ODL_SGS:
-            resources = obj_getter(dbcontext, default_sg=True)
-        else:
-            resources = obj_getter(dbcontext)
-        for resource in resources:
-            try:
-                # Convert underscores to dashes in the URL for ODL
-                collection_name_url = collection_name.replace('_', '-')
-                urlpath = collection_name_url + '/' + resource['id']
-                self.client.sendjson('get', urlpath, None)
-            except requests.exceptions.HTTPError as e:
-                with excutils.save_and_reraise_exception() as ctx:
-                    if e.response.status_code == requests.codes.not_found:
-                        filter_cls.filter_create_attributes_with_plugin(
-                            resource, plugin, dbcontext)
-                        to_be_synced.append(resource)
-                        ctx.reraise = False
-            else:
-                # TODO(yamahata): compare result with resource.
-                # If they don't match, update it below
-                pass
-
-        key = collection_name[:-1] if len(to_be_synced) == 1 else (
-            collection_name)
-        # Convert underscores to dashes in the URL for ODL
-        collection_name_url = collection_name.replace('_', '-')
-        self.client.sendjson('post', collection_name_url, {key: to_be_synced})
-
-        # https://bugs.launchpad.net/networking-odl/+bug/1371115
-        # TODO(yamahata): update resources with unsyned attributes
-        # TODO(yamahata): find dangling ODL resouce that was deleted in
-        # neutron db
-
-    @utils.synchronized('odl-sync-full')
-    def sync_full(self, plugin):
-        """Resync the entire database to ODL.
-
-        Transition to the in-sync state on success.
-        Note: we only allow a single thread in here at a time.
-        """
-        if not self.out_of_sync:
-            return
-        dbcontext = neutron_context.get_admin_context()
-        for collection_name in [odl_const.ODL_NETWORKS,
-                                odl_const.ODL_SUBNETS,
-                                odl_const.ODL_PORTS,
-                                odl_const.ODL_SGS,
-                                odl_const.ODL_SG_RULES]:
-            self.sync_resources(plugin, dbcontext, collection_name)
-        self.out_of_sync = False
-
+    # TODO(yamahata): Unused for now. Later fix up this method for
+    # optimization for latency
     def sync_single_resource(self, operation, object_type, context):
         """Sync over a single resource from Neutron to OpenDaylight.
 
@@ -283,6 +249,9 @@ class OpenDaylightDriver(object):
         filter attributes out which are not required for the requisite
         operation (create or update) being handled.
         """
+        LOG.debug('not implemented yet')
+        return
+
         # Convert underscores to dashes in the URL for ODL
         object_type_url = object_type.replace('_', '-')
         try:
@@ -313,29 +282,14 @@ class OpenDaylightDriver(object):
                            'object_id': obj_id})
                 self.out_of_sync = True
 
-    def sync_from_callback(self, operation, object_type, res_id,
-                           resource_dict):
-        try:
-            if operation == odl_const.ODL_DELETE:
-                self.out_of_sync |= not self.client.try_delete(
-                    object_type + '/' + res_id)
-            else:
-                if operation == odl_const.ODL_CREATE:
-                    urlpath = object_type
-                    method = 'post'
-                elif operation == odl_const.ODL_UPDATE:
-                    urlpath = object_type + '/' + res_id
-                    method = 'put'
-                self.client.sendjson(method, urlpath, resource_dict)
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                LOG.error(_LE("Unable to perform %(operation)s on "
-                              "%(object_type)s %(res_id)s %(resource_dict)s"),
-                          {'operation': operation,
-                           'object_type': object_type,
-                           'res_id': res_id,
-                           'resource_dict': resource_dict})
-                self.out_of_sync = True
+    def sync_from_callback(self, operation, object_type, res_id, resource):
+        # TODO(yamahata): utilize ML2 security group driver and optimize
+        # synchronize path in order to reduce latancy
+        assert res_id
+        context = neutron_context.get_admin_context()
+        self.journal_resource(context,
+                              object_type, res_id, operation, resource)
+        self.journal.wakeup()
 
     def bind_port(self, port_context):
         """Set binding for all valid segments

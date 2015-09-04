@@ -28,11 +28,17 @@ class OpenDaylightRestClient(object):
         self.timeout = timeout
         self.auth = (username, password)
 
+    @staticmethod
+    def serialize(obj):
+        if isinstance(obj, str):
+            return obj
+        return jsonutils.dumps(obj, indent=2) if obj else None
+
     def sendjson(self, method, urlpath, obj):
         """Send json to the OpenDaylight controller."""
 
         headers = {'Content-Type': 'application/json'}
-        data = jsonutils.dumps(obj, indent=2) if obj else None
+        data = self.serialize(obj)
         url = '/'.join([self.url, urlpath])
         LOG.debug("Sending METHOD (%(method)s) URL (%(url)s) JSON (%(obj)s)",
                   {'method': method, 'url': url, 'obj': obj})

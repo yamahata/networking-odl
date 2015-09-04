@@ -16,6 +16,7 @@
 from networking_odl.common import client
 from networking_odl.common import constants as odl_const
 from networking_odl.ml2 import mech_driver
+from networking_odl.ml2 import state_syncer
 
 import mock
 from oslo_serialization import jsonutils
@@ -232,21 +233,17 @@ class OpenDaylightMechanismDriverTestCase(base.BaseTestCase):
                 cls._status_code_msgs[status_code], response=response)))
         return response
 
+    # TODO(yamahata): tests for precommit
+    # TODO(yamahata): tests for state syncer
+
     def _test_single_operation(self, method, context, status_code,
                                exc_class=None, *args, **kwargs):
         self.mech.odl_drv.out_of_sync = False
-        request_response = self._get_mock_request_response(status_code)
-        with mock.patch('requests.request',
-                        return_value=request_response) as mock_method:
-            if exc_class is not None:
-                self.assertRaises(exc_class, method, context)
-            else:
-                method(context)
-        mock_method.assert_called_once_with(
-            headers={'Content-Type': 'application/json'},
-            auth=(config.cfg.CONF.ml2_odl.username,
-                  config.cfg.CONF.ml2_odl.password),
-            timeout=config.cfg.CONF.ml2_odl.timeout, *args, **kwargs)
+        with mock.patch.object(state_syncer.OpenDaylightStateSyncer,
+                               'wakeup') as (
+                wakeup_method):
+            method(context)
+        wakeup_method.assert_called_once_with()
 
     def _test_create_resource_postcommit(self, object_type, status_code,
                                          exc_class=None):
