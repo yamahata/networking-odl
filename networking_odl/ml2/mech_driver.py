@@ -285,6 +285,9 @@ class OpenDaylightDriver(object):
     def sync_from_callback(self, operation, object_type, res_id, resource):
         # TODO(yamahata): utilize ML2 security group driver and optimize
         # synchronize path in order to reduce latancy
+        if operation == odl_const.ODL_CREATE:
+            assert not res_id
+            res_id = resource['id']
         assert res_id
         context = neutron_context.get_admin_context()
         self.journal_resource(context,
